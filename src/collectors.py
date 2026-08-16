@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Iterable
+from urllib.parse import parse_qs, urlparse
+
+import feedparser
+import httpx
+from bs4 import BeautifulSoup
+
+from src.config import settings
+from src.links import is_trusted_url, is_valid_article_url
+from src.models import Article
+from src.sources import FOCUS_RSS_FEEDS, GLOBAL_RSS_FEEDS, KR_RSS_FEEDS
+
+logger = logging.getLogger(__name__)
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+FOCUS_KEYWORDS = (
+    "nac",
+    "network access control",
+    "edr",
+    "endpoint detection",
+    "xedr",
+    "ssl vpn",
+    "sslvpn",
+    "zero trust",
+    "ztna",
+    "지니언스",
+    "genians",
+    "네트워크 접근",
+    "엔드포인트 탐지",
+    "제로트러스트",
+)
+
+
+def is_focus_text(title: str, summary: str) -> bool:
+    blob = f"{title} {summary}".lower()
+    return any(k in blob for k in FOCUS_KEYWORDS)
+
+
+def _strip_html(text: str) -> str:
+    return re.sub(r"\s+", " ", _TAG_RE.sub(" ", text or "")).strip()
+
+
+def _unwrap_google_news(entry, fallback: str) -> str:
+    html = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+    soup = BeautifulSoup(html, "lxml")
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"].strip()
+        if is_valid_article_url(href) or is_trusted_url(href):
+            return href
+    source = getattr(entry, "source", None)
+    if source is not None:
+        href = getattr(source, "url", None) or (source.get("url") if isinstance(source, dict) else None)
+        if href and (is_valid_article_url(href) or is_trusted_url(href)):
+            return href
+    parsed = urlparse(fallback)
+    qs = parse_qs(parsed.query)
+    if "url" in qs and is_trusted_url(qs["url"][0]):
+        return qs["url"][0]
+    return fallback
+
+
+def _article_id(title: str, url: str) -> str:
+    key = f"{title.strip().lower()}|{url.strip().lower()}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _is_fresh(published: datetime | None, cutoff: datetime) -> bool:
+    if published is None:
+        return True
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    return published >= cutoff
+
+
+def _parse_entry(source: str, entry, region: str, force_focus: bool = False) -> Article | None:
+    title = _strip_html(getattr(entry, "title", "") or "")
+    raw_link = (getattr(entry, "link", "") or "").strip()
+    if not title or not raw_link:
+        return None
+
+    url = _unwrap_google_news(entry, raw_link) if "news.google.com" in raw_link else raw_link
+    url = url.split("#")[0]
+    if not is_valid_article_url(url):
+        return None
+    if region == "kr" and not is_trusted_url(url, "kr") and not urlparse(url).netloc.lower().endswith(".kr"):
+        return None
+    if region == "global" and not is_trusted_url(url, "global"):
+        return None
+    if region == "any" and not is_trusted_url(url):
+        return None
+
+    published = None
+    if getattr(entry, "published_parsed", None):
+        published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+    elif getattr(entry, "updated_parsed", None):
+        published = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+
+    summary = _strip_html(getattr(entry, "summary", "") or getattr(entry, "description", "") or "")
+    lang = "ko" if region == "kr" else "en"
+    resolved_region = "kr" if is_trusted_url(url, "kr") or urlparse(url).netloc.lower().endswith(".kr") else "global"
+    if region in ("kr", "global"):
+        resolved_region = region
+    return Article(
+        title=title,
+        url=url,
+        source=source,
+        published_at=published,
+        summary_raw=summary[:1200],
+        language=lang,
+        region=resolved_region,
+        topic="focus" if force_focus or is_focus_text(title, summary) else "general",
+    )
+
+
+def _fetch_feeds(
+    feeds: list[tuple[str, str]],
+    region: str,
+    cutoff: datetime,
+    force_focus: bool = False,
+) -> list[Article]:
+    articles: list[Article] = []
+    headers = {"User-Agent": settings.user_agent}
+    with httpx.Client(timeout=settings.http_timeout, headers=headers, follow_redirects=True) as client:
+        for source, url in feeds:
+            try:
+                resp = client.get(url)
+                resp.raise_for_status()
+                feed = feedparser.parse(resp.content)
+                fresh: list[Article] = []
+                parsed: list[Article] = []
+                for entry in feed.entries:
+                    item = _parse_entry(source, entry, region, force_focus=force_focus)
+                    if not item:
+                        continue
+                    parsed.append(item)
+                    if _is_fresh(item.published_at, cutoff):
+                        fresh.append(item)
+                articles.extend(fresh if fresh else parsed[:8])
+                if not fresh and parsed:
+                    logger.warning("%s: 최근 시간 필터 0건, 최신 %s건으로 대체", source, min(8, len(parsed)))
+            except Exception:
+                logger.exception("RSS 수집 실패: %s", source)
+    return articles
+
+
+def fetch_newsapi_articles(cutoff: datetime) -> list[Article]:
+    if not settings.newsapi_key:
+        return []
+
+    params = {
+        "q": "cybersecurity OR ransomware OR vulnerability OR EDR OR ZTNA",
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 50,
+        "from": cutoff.isoformat(),
+        "apiKey": settings.newsapi_key,
+    }
+    try:
+        with httpx.Client(timeout=settings.http_timeout) as client:
+            resp = client.get("https://newsapi.org/v2/everything", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        logger.exception("NewsAPI 수집 실패")
+        return []
+
+    items: list[Article] = []
+    for raw in data.get("articles", []):
+        title = (raw.get("title") or "").strip()
+        url = (raw.get("url") or "").strip()
+        if not title or not url or title == "[Removed]" or not is_valid_article_url(url):
+            continue
+        published = None
+        if raw.get("publishedAt"):
+            try:
+                published = datetime.fromisoformat(raw["publishedAt"].replace("Z", "+00:00"))
+            except ValueError:
+                published = None
+        items.append(
+            Article(
+                title=title,
+                url=url,
+                source=(raw.get("source") or {}).get("name") or "NewsAPI",
+                published_at=published,
+                summary_raw=(raw.get("description") or "")[:1200],
+                region="global",
+                topic="focus" if is_focus_text(title, raw.get("description") or "") else "general",
+            )
+        )
+    return items
+
+
+def dedupe(articles: Iterable[Article]) -> list[Article]:
+    seen: set[str] = set()
+    unique: list[Article] = []
+    for article in articles:
+        aid = _article_id(article.title, article.url)
+        if aid in seen:
+            continue
+        seen.add(aid)
+        unique.append(article)
+    return unique
+
+
+def collect_articles() -> list[Article]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.lookback_hours)
+    pooled = (
+        _fetch_feeds(KR_RSS_FEEDS, "kr", cutoff)
+        + _fetch_feeds(GLOBAL_RSS_FEEDS, "global", cutoff)
+        + _fetch_feeds(FOCUS_RSS_FEEDS, "any", cutoff, force_focus=True)
+        + fetch_newsapi_articles(cutoff)
+    )
+    unique = dedupe(pooled)
+    unique.sort(key=lambda a: a.published_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    logger.info(
+        "수집 %s건 / 링크 검증 후 %s건 (국내 %s, 해외 %s, 제품포커스 %s)",
+        len(pooled),
+        len(unique),
+        sum(1 for a in unique if a.region == "kr"),
+        sum(1 for a in unique if a.region == "global"),
+        sum(1 for a in unique if a.topic == "focus"),
+    )
+    return unique[: settings.max_collected_articles]
