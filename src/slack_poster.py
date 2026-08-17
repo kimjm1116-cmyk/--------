@@ -67,8 +67,8 @@ def _section_blocks(
         blocks.append({"type": "divider"})
     blocks.append(
         {
-            "type": "header",
-            "text": {"type": "plain_text", "text": title[:150], "emoji": True},
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{title}*"},
         }
     )
     if divider_after_header:
@@ -94,7 +94,15 @@ def _intro_blocks(briefing: Briefing) -> list[dict[str, Any]]:
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": f"🛡️ 지니언스 데일리 보안 브리핑  ·  {briefing.date_label}",
+                "text": "지니언스 데일리 보안 브리핑",
+                "emoji": True,
+            },
+        },
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": briefing.date_label[:150],
                 "emoji": True,
             },
         },

@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     newsapi_key: str = ""
 
-    lookback_hours: int = 72
+    lookback_hours: int = 24
     max_collected_articles: int = 120
     section_min: int = 2
     section_max: int = 3

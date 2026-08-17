@@ -58,9 +58,8 @@ focus_product는 예외적으로 정확히 3개다.
 focus_product 항목에는 product 필드를 edr|nac|vpn 중 하나로 넣어라.
 제목/요약/인사이트에 EDR, NAC, VPN 같은 분류 라벨을 붙이지 마라. 본문만 자연스럽게 써라.
 
-title_ko는 자연스러운 한국어 제목(영문 원문 제목 금지).
-summary_ko는 한국어 1~2문장.
-insight는 지니언스 관점 짧은 한국어 코멘트(한 줄).
+스키마 예시 문구(한국어 제목, 한국어 요약 등)를 실제 기사 내용으로 절대 복사하지 마라.
+title_ko/summary_ko/insight에는 후보 기사의 실제 내용을 번역·요약한 문장만 넣어라.
 headline은 짧은 한 줄.
 """
 
@@ -100,10 +99,10 @@ def _user_prompt(articles: list[Article], date_label: str) -> str:
    - 각 항목에 "product": "edr" | "nac" | "vpn"
    - 분류 소제목은 출력하지 말고 기사 본문만 작성
 
-JSON:
+JSON 필드만 맞추고, 값은 후보 기사에서 만들어라. 설명용 문구를 값에 넣지 마라.
 {{
-  "headline": "한 줄",
-  "kr_security": [{{"id": 0, "score": 8, "title_ko": "한국어로 번역된 제목", "summary_ko": "한국어 요약", "insight": "한국어 인사이트"}}],
+  "headline": "",
+  "kr_security": [{{"id": 0, "score": 8, "title_ko": "", "summary_ko": "", "insight": ""}}],
   "global_security": [],
   "kr_market": [],
   "global_market": [],
@@ -179,7 +178,8 @@ def _translate_english_fields(client: OpenAI, briefing: Briefing) -> None:
             {
                 "role": "user",
                 "content": (
-                    '각 항목을 {"items":[{"i":0,"title_ko":"한국어 제목","summary_ko":"한국어 요약"}]} 로 반환. '
+                    "각 항목 i에 대해 실제 번역문만 넣어라. 설명 문구를 쓰지 마라. "
+                    '{"items":[{"i":0,"title_ko":"...","summary_ko":"..."}]} 형식.\n'
                     "title/summary가 빈 문자열이면 그 필드는 생략.\n"
                     + json.dumps({"items": targets}, ensure_ascii=False)
                 ),
@@ -192,14 +192,38 @@ def _translate_english_fields(client: OpenAI, briefing: Briefing) -> None:
         row = by_i.get(i)
         if not row:
             continue
-        if row.get("title_ko"):
+        if row.get("title_ko") and not _is_placeholder(row["title_ko"]):
             item.title_ko = _clean(row["title_ko"], 70)
-        if row.get("summary_ko"):
+        if row.get("summary_ko") and not _is_placeholder(row["summary_ko"]):
             item.summary_ko = _two_lines(row["summary_ko"])
+
+
+PLACEHOLDER_TEXT = {
+    "한국어로 번역된 제목",
+    "한국어 제목",
+    "한국어 요약",
+    "한국어 인사이트",
+    "한 줄",
+    "실제 한국어 제목",
+    "한국어 번역",
+}
+
+
+def _is_placeholder(text: str) -> bool:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    return t in PLACEHOLDER_TEXT
 
 
 def _clean(text: str, max_chars: int) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())[:max_chars].rstrip(" ,;.")
+
+
+def _real_text(candidate: str | None, fallback: str, max_chars: int) -> str:
+    if candidate and not _is_placeholder(candidate):
+        return _clean(candidate, max_chars)
+    if fallback and not _is_placeholder(fallback):
+        return _clean(fallback, max_chars)
+    return _clean(fallback or "보안 뉴스", max_chars)
 
 
 def _two_lines(text: str) -> str:
@@ -273,11 +297,15 @@ def _infer_product(article: Article, hint: str = "") -> str:
 
 def _to_item(article: Article, item: dict | None, product: str) -> CuratedItem:
     return CuratedItem(
-        title_ko=_clean((item or {}).get("title_ko") or article.title, 70),
+        title_ko=_real_text((item or {}).get("title_ko"), article.title, 70),
         url=article.url,
         source=article.source,
-        summary_ko=_two_lines((item or {}).get("summary_ko") or article.summary_raw or article.title),
-        insight=_clean((item or {}).get("insight") or "제품·영업 메시지와 연결해 볼 만하다.", 80),
+        summary_ko=_two_lines(
+            (item or {}).get("summary_ko")
+            if (item or {}).get("summary_ko") and not _is_placeholder((item or {}).get("summary_ko") or "")
+            else (article.summary_raw or article.title)
+        ),
+        insight=_real_text((item or {}).get("insight"), "제품·영업 메시지와 연결해 볼 만하다.", 80),
         score=_parse_score((item or {}).get("score")),
         product_tag=product,
     )
@@ -357,17 +385,23 @@ def _map_section(
             continue
         if idx in used_ids or not is_valid_article_url(article.url):
             continue
+        if _is_placeholder(item.get("title_ko") or "") and _is_placeholder(item.get("summary_ko") or ""):
+            continue
         if _is_duplicate(article.url, item.get("title_ko") or article.title, seen):
             continue
         used_ids.add(idx)
-        _mark_seen(article.url, item.get("title_ko") or article.title, seen)
+        _mark_seen(article.url, article.title, seen)
         ranked.append(
             CuratedItem(
-                title_ko=_clean(item.get("title_ko") or article.title, 70),
+                title_ko=_real_text(item.get("title_ko"), article.title, 70),
                 url=article.url,
                 source=article.source,
-                summary_ko=_two_lines(item.get("summary_ko") or article.summary_raw or article.title),
-                insight=_clean(item.get("insight") or "제품·영업 메시지와 연결해 볼 만하다.", 80),
+                summary_ko=_two_lines(
+                    item.get("summary_ko")
+                    if item.get("summary_ko") and not _is_placeholder(item.get("summary_ko") or "")
+                    else (article.summary_raw or article.title)
+                ),
+                insight=_real_text(item.get("insight"), "제품·영업 메시지와 연결해 볼 만하다.", 80),
                 score=_parse_score(item.get("score")),
             )
         )
@@ -465,8 +499,11 @@ def curate(articles: list[Article]) -> Briefing:
         )
         mapped[name] = items
 
+    headline = raw.get("headline") or "오늘의 보안 브리핑"
+    if _is_placeholder(headline):
+        headline = "오늘의 보안 브리핑"
     briefing = Briefing(
-        headline=_clean(raw.get("headline") or "오늘의 보안 브리핑", 40),
+        headline=_clean(headline, 40),
         date_label=date_label,
         editor_note="",
         kr_security=mapped["kr_security"],

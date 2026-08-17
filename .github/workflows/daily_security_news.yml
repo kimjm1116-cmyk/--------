@@ -2,9 +2,12 @@ name: Daily Security News
 
 on:
   schedule:
-    # KST 07:30 = UTC 22:30
-    - cron: "30 22 * * *"
+    # KST 07:15 = UTC 22:15
+    - cron: "15 22 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   send-briefing:
@@ -27,5 +30,16 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           TZ: Asia/Seoul
-        # 엔트리포인트는 src/main.py 이므로 모듈로 실행합니다.
         run: python -m src.main
+
+      - name: Commit sent_articles.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sent_articles.json
+          if git diff --cached --quiet; then
+            echo "No sent_articles.json changes"
+          else
+            git commit -m "chore: update sent_articles.json"
+            git push
+          fi

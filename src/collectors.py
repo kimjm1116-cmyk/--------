@@ -4,6 +4,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
@@ -71,12 +72,40 @@ def _article_id(title: str, url: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _parse_published(entry) -> datetime | None:
+    for parsed in (
+        getattr(entry, "published_parsed", None),
+        getattr(entry, "updated_parsed", None),
+    ):
+        if parsed:
+            try:
+                return datetime(*parsed[:6], tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+    for raw in (
+        getattr(entry, "published", None),
+        getattr(entry, "updated", None),
+        getattr(entry, "pubDate", None),
+    ):
+        if not raw:
+            continue
+        try:
+            dt = parsedate_to_datetime(str(raw))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
 def _is_fresh(published: datetime | None, cutoff: datetime) -> bool:
     if published is None:
-        return True
+        return False
     if published.tzinfo is None:
         published = published.replace(tzinfo=timezone.utc)
-    return published >= cutoff
+    now = datetime.now(timezone.utc) + timedelta(minutes=30)
+    return cutoff <= published <= now
 
 
 def _parse_entry(source: str, entry, region: str, force_focus: bool = False) -> Article | None:
@@ -96,11 +125,7 @@ def _parse_entry(source: str, entry, region: str, force_focus: bool = False) -> 
     if region == "any" and not is_trusted_url(url):
         return None
 
-    published = None
-    if getattr(entry, "published_parsed", None):
-        published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-    elif getattr(entry, "updated_parsed", None):
-        published = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+    published = _parse_published(entry)
 
     summary = _strip_html(getattr(entry, "summary", "") or getattr(entry, "description", "") or "")
     lang = "ko" if region == "kr" else "en"
@@ -133,18 +158,10 @@ def _fetch_feeds(
                 resp = client.get(url)
                 resp.raise_for_status()
                 feed = feedparser.parse(resp.content)
-                fresh: list[Article] = []
-                parsed: list[Article] = []
                 for entry in feed.entries:
                     item = _parse_entry(source, entry, region, force_focus=force_focus)
-                    if not item:
-                        continue
-                    parsed.append(item)
-                    if _is_fresh(item.published_at, cutoff):
-                        fresh.append(item)
-                articles.extend(fresh if fresh else parsed[:8])
-                if not fresh and parsed:
-                    logger.warning("%s: 최근 시간 필터 0건, 최신 %s건으로 대체", source, min(8, len(parsed)))
+                    if item and _is_fresh(item.published_at, cutoff):
+                        articles.append(item)
             except Exception:
                 logger.exception("RSS 수집 실패: %s", source)
     return articles
@@ -183,6 +200,8 @@ def fetch_newsapi_articles(cutoff: datetime) -> list[Article]:
                 published = datetime.fromisoformat(raw["publishedAt"].replace("Z", "+00:00"))
             except ValueError:
                 published = None
+        if published is None or not _is_fresh(published, cutoff):
+            continue
         items.append(
             Article(
                 title=title,
@@ -209,8 +228,9 @@ def dedupe(articles: Iterable[Article]) -> list[Article]:
     return unique
 
 
-def collect_articles() -> list[Article]:
+def collect_articles(exclude_urls: set[str] | None = None) -> list[Article]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.lookback_hours)
+    blocked = {(u or "").strip().rstrip("/").lower() for u in (exclude_urls or set()) if u}
     pooled = (
         _fetch_feeds(KR_RSS_FEEDS, "kr", cutoff)
         + _fetch_feeds(GLOBAL_RSS_FEEDS, "global", cutoff)
@@ -218,9 +238,15 @@ def collect_articles() -> list[Article]:
         + fetch_newsapi_articles(cutoff)
     )
     unique = dedupe(pooled)
+    if blocked:
+        unique = [
+            a
+            for a in unique
+            if a.url.strip().rstrip("/").lower() not in blocked
+        ]
     unique.sort(key=lambda a: a.published_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     logger.info(
-        "수집 %s건 / 링크 검증 후 %s건 (국내 %s, 해외 %s, 제품포커스 %s)",
+        "수집 %s건 / 24시간·전송이력 필터 후 %s건 (국내 %s, 해외 %s, 제품포커스 %s)",
         len(pooled),
         len(unique),
         sum(1 for a in unique if a.region == "kr"),
