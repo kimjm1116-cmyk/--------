@@ -4,6 +4,10 @@ KR_RSS_FEEDS = [
     ("보안뉴스", "https://www.boannews.com/media/news_rss.xml"),
     ("데일리시큐", "https://www.dailysecu.com/rss/allArticle.xml"),
     (
+        "Google News 국내 보안",
+        "https://news.google.com/rss/search?q=(%ED%95%9C%EA%B5%AD+OR+%EA%B5%AD%EB%82%B4+OR+KISA)+%EB%B3%B4%EC%95%88+when:1d&hl=ko&gl=KR&ceid=KR:ko",
+    ),
+    (
         "Google News 보안",
         "https://news.google.com/rss/search?q=%EB%B3%B4%EC%95%88+when:1d&hl=ko&gl=KR&ceid=KR:ko",
     ),

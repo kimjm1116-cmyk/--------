@@ -13,7 +13,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from src.config import settings
-from src.links import is_trusted_url, is_valid_article_url
+from src.google_news import is_google_news_url, resolve_google_news_url
+from src.links import classify_region, is_trusted_url, is_valid_article_url
 from src.models import Article
 from src.sources import FOCUS_RSS_FEEDS, GLOBAL_RSS_FEEDS, KR_RSS_FEEDS
 
@@ -48,23 +49,31 @@ def _strip_html(text: str) -> str:
     return re.sub(r"\s+", " ", _TAG_RE.sub(" ", text or "")).strip()
 
 
-def _unwrap_google_news(entry, fallback: str) -> str:
+def _resolve_candidate_url(url: str) -> str | None:
+    candidate = url.strip().split("#")[0]
+    if not candidate:
+        return None
+    if is_google_news_url(candidate):
+        candidate = resolve_google_news_url(candidate) or ""
+    if candidate and is_valid_article_url(candidate):
+        return candidate
+    return None
+
+
+def _unwrap_google_news(entry, fallback: str) -> str | None:
     html = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
     soup = BeautifulSoup(html, "lxml")
-    for anchor in soup.find_all("a", href=True):
-        href = anchor["href"].strip()
-        if is_valid_article_url(href) or is_trusted_url(href):
-            return href
-    source = getattr(entry, "source", None)
-    if source is not None:
-        href = getattr(source, "url", None) or (source.get("url") if isinstance(source, dict) else None)
-        if href and (is_valid_article_url(href) or is_trusted_url(href)):
-            return href
+    candidates = [a["href"].strip() for a in soup.find_all("a", href=True)]
+    candidates.append(fallback)
     parsed = urlparse(fallback)
     qs = parse_qs(parsed.query)
-    if "url" in qs and is_trusted_url(qs["url"][0]):
-        return qs["url"][0]
-    return fallback
+    if "url" in qs:
+        candidates.append(qs["url"][0])
+    for href in candidates:
+        resolved = _resolve_candidate_url(href)
+        if resolved:
+            return resolved
+    return None
 
 
 def _article_id(title: str, url: str) -> str:
@@ -108,15 +117,27 @@ def _is_fresh(published: datetime | None, cutoff: datetime) -> bool:
     return cutoff <= published <= now
 
 
-def _parse_entry(source: str, entry, region: str, force_focus: bool = False) -> Article | None:
+def _parse_entry(
+    source: str,
+    entry,
+    region: str,
+    cutoff: datetime,
+    force_focus: bool = False,
+) -> Article | None:
     title = _strip_html(getattr(entry, "title", "") or "")
     raw_link = (getattr(entry, "link", "") or "").strip()
     if not title or not raw_link:
         return None
 
-    url = _unwrap_google_news(entry, raw_link) if "news.google.com" in raw_link else raw_link
-    url = url.split("#")[0]
-    if not is_valid_article_url(url):
+    published = _parse_published(entry)
+    if not _is_fresh(published, cutoff):
+        return None
+
+    if "news.google.com" in raw_link:
+        url = _unwrap_google_news(entry, raw_link)
+    else:
+        url = _resolve_candidate_url(raw_link)
+    if not url:
         return None
     if region == "kr" and not is_trusted_url(url, "kr") and not urlparse(url).netloc.lower().endswith(".kr"):
         return None
@@ -125,13 +146,9 @@ def _parse_entry(source: str, entry, region: str, force_focus: bool = False) -> 
     if region == "any" and not is_trusted_url(url):
         return None
 
-    published = _parse_published(entry)
-
     summary = _strip_html(getattr(entry, "summary", "") or getattr(entry, "description", "") or "")
-    lang = "ko" if region == "kr" else "en"
-    resolved_region = "kr" if is_trusted_url(url, "kr") or urlparse(url).netloc.lower().endswith(".kr") else "global"
-    if region in ("kr", "global"):
-        resolved_region = region
+    lang = "ko" if any("\uac00" <= c <= "\ud7a3" for c in title) else "en"
+    resolved_region = classify_region(url, title, summary)
     return Article(
         title=title,
         url=url,
@@ -159,8 +176,8 @@ def _fetch_feeds(
                 resp.raise_for_status()
                 feed = feedparser.parse(resp.content)
                 for entry in feed.entries:
-                    item = _parse_entry(source, entry, region, force_focus=force_focus)
-                    if item and _is_fresh(item.published_at, cutoff):
+                    item = _parse_entry(source, entry, region, cutoff, force_focus=force_focus)
+                    if item:
                         articles.append(item)
             except Exception:
                 logger.exception("RSS 수집 실패: %s", source)
@@ -202,6 +219,7 @@ def fetch_newsapi_articles(cutoff: datetime) -> list[Article]:
                 published = None
         if published is None or not _is_fresh(published, cutoff):
             continue
+        resolved = classify_region(url, title, raw.get("description") or "")
         items.append(
             Article(
                 title=title,
@@ -209,7 +227,7 @@ def fetch_newsapi_articles(cutoff: datetime) -> list[Article]:
                 source=(raw.get("source") or {}).get("name") or "NewsAPI",
                 published_at=published,
                 summary_raw=(raw.get("description") or "")[:1200],
-                region="global",
+                region=resolved,
                 topic="focus" if is_focus_text(title, raw.get("description") or "") else "general",
             )
         )

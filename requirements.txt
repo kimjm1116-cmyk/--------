@@ -9,3 +9,4 @@ pydantic-settings>=2.4.0
 beautifulsoup4>=4.12.3
 lxml>=5.2.0
 dateparser>=1.2.0
+googlenewsdecoder>=0.1.7

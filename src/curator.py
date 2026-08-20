@@ -44,6 +44,7 @@ id만 고르고 url은 만들지 마라. 원문 링크는 시스템이 붙인다
 각 후보에 지니언스 비즈니스 중요도 score(1~10 정수)를 매겨 정렬에만 쓴다.
 가점: 대규모 사고, 고위험 취약점, 벤더/경쟁사, NAC/EDR/SSL VPN/제로트러스트
 감점: 코인 해킹, 가십, 단순 보도자료. 감점 기사는 뒤로 미루되, 섹션이 비면 연관 기사로 채워라.
+kr_security와 kr_market에는 region=kr인 후보만 넣어라. 미국·CISA·NSA·FBI 등 해외 단독 뉴스는 global_security로 보내라.
 
 중복 할당 절대 금지. 5개 섹션 전체에서 같은 기사(같은 id, 같은 사건, 같은 원문)는 한 섹션에만 넣어라.
 프랑스 국세청 해킹, 구글 양자내성암호처럼 이슈가 겹치면 가장 적합한 섹션 하나에만 두고 나머지는 다른 고유 기사로 채워라.
@@ -90,10 +91,10 @@ def _user_prompt(articles: list[Article], date_label: str) -> str:
 일반 섹션은 고유 기사 3~4개를 넣고, 최종적으로 최소 2개가 남도록 여유 있게 골라라.
 모든 섹션의 title_ko는 한국어로 번역된 제목이어야 한다. 영어 제목 금지.
 
-1) kr_security 국내 주요 보안 뉴스
-2) global_security 해외 주요 보안 뉴스
-3) kr_market 국내 보안 시장 동향
-4) global_market 해외 보안 시장 동향
+1) kr_security 국내 주요 보안 뉴스 — region=kr 후보만. 대한민국 침해사고·취약점·KISA·국내 기업·국내 정부 정책. 미국 CISA/NSA/FBI·미국 단독 이슈 절대 금지.
+2) global_security 해외 주요 보안 뉴스 — region=global 또는 해외 단독 이슈
+3) kr_market 국내 보안 시장 동향 — region=kr 후보만. 국내 IT/보안 시장·국내 벤더
+4) global_market 해외 보안 시장 동향 — region=global
 5) focus_product 정확히 3개, 구성은 1:1:1
    - EDR 1, NAC 1, SSL VPN/제로트러스트 1
    - 각 항목에 "product": "edr" | "nac" | "vpn"
@@ -375,6 +376,7 @@ def _map_section(
     used_ids: set[int],
     seen: set[str],
     limit: int,
+    require_region: str | None = None,
 ) -> list[CuratedItem]:
     ranked: list[CuratedItem] = []
     for item in raw_items or []:
@@ -382,6 +384,8 @@ def _map_section(
             idx = int(item["id"])
             article = articles[idx]
         except (KeyError, ValueError, IndexError, TypeError):
+            continue
+        if require_region and article.region != require_region:
             continue
         if idx in used_ids or not is_valid_article_url(article.url):
             continue
@@ -444,26 +448,8 @@ def _fill_section(
                 score=5,
             )
         )
-    if len(mapped) < minimum:
-        for idx, article in enumerate(articles):
-            if len(mapped) >= minimum:
-                break
-            if idx in used_ids or not is_valid_article_url(article.url):
-                continue
-            if _is_duplicate(article.url, article.title, seen):
-                continue
-            used_ids.add(idx)
-            _mark_seen(article.url, article.title, seen)
-            mapped.append(
-                CuratedItem(
-                    title_ko=_clean(article.title, 70),
-                    url=article.url,
-                    source=article.source,
-                    summary_ko=_two_lines(article.summary_raw or article.title),
-                    insight="관련 맥락으로 원문을 확인하면 좋다.",
-                    score=4,
-                )
-            )
+    if len(mapped) < minimum and region:
+        logger.warning("섹션(region=%s) 후보 부족: %s/%s", region, len(mapped), minimum)
     mapped.sort(key=lambda x: x.score, reverse=True)
     return mapped[:limit]
 
@@ -485,8 +471,15 @@ def curate(articles: list[Article]) -> Briefing:
     mapped["focus_product"] = _map_focus(raw.get("focus_product") or [], articles, used, seen)
 
     for name in ("kr_security", "global_security", "kr_market", "global_market"):
-        items = _map_section(raw.get(name) or [], articles, used, seen, 4)
         hint = SECTION_FILL[name]
+        items = _map_section(
+            raw.get(name) or [],
+            articles,
+            used,
+            seen,
+            4,
+            require_region=hint["region"],
+        )
         items = _fill_section(
             items,
             articles,
