@@ -1,10 +1,12 @@
 name: Daily Security News
 
 on:
-  schedule:
-    # KST 07:15 = UTC 22:15
-    - cron: "15 22 * * *"
+  # 매일 07:30 KST 실행은 cron-job.org → workflow_dispatch 로 트리거
   workflow_dispatch:
+
+concurrency:
+  group: daily-security-news
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -12,7 +14,7 @@ permissions:
 jobs:
   send-briefing:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
